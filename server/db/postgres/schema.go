@@ -11,6 +11,7 @@ func (a *Adapter) CreateSchema() error {
 		createTopicsTable,
 		createMessagesTable,
 		createBotConfigTable,
+		createAgentAccessTable,
 		createRateLimitTable,
 		createGroupsTable,
 		createGroupMembersTable,
@@ -22,7 +23,14 @@ func (a *Adapter) CreateSchema() error {
 		migrateBotConfigAddOwnerID,
 		migrateBotConfigAddVisibility,
 		migrateBotConfigAddTenantName,
+		migrateAgentAccessAddStatus,
+		migrateBotConfigAddBodyID,
 		migrateMessagesAddCodeMode,
+		migrateMessagesAddClientMsgID,
+		migrateGroupsAddCreatedAtColumn,
+		migrateGroupsBackfillCreatedAt,
+		migrateGroupsCreatedAtDefault,
+		migrateGroupsCreatedAtNotNull,
 		migrateGroupsAddAnnouncement,
 		migrateGroupMembersAddMuted,
 		createUsersIndexes,
@@ -30,6 +38,7 @@ func (a *Adapter) CreateSchema() error {
 		createTopicsIndexes,
 		createMessagesIndexes,
 		createBotConfigIndexes,
+		createAgentAccessIndexes,
 		createGroupMembersIndexes,
 		createFeedbackIndexes,
 		createAuthServicesIndexes,
@@ -104,6 +113,7 @@ CREATE TABLE IF NOT EXISTS messages (
     mode VARCHAR(20) DEFAULT 'normal',
     role VARCHAR(20) DEFAULT NULL,
     reply_to BIGINT DEFAULT NULL,
+    client_msg_id VARCHAR(128) DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `
@@ -119,8 +129,25 @@ CREATE TABLE IF NOT EXISTS bot_config (
     api_key VARCHAR(128) DEFAULT NULL,
     visibility VARCHAR(16) NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','private')),
     tenant_name VARCHAR(128) DEFAULT NULL,
+    body_id VARCHAR(128) DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`
+
+const createAgentAccessTable = `
+CREATE TABLE IF NOT EXISTS agent_access (
+    id BIGSERIAL PRIMARY KEY,
+    agent_uid BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_uid BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status VARCHAR(24) NOT NULL DEFAULT 'pending_accept' CHECK (status IN ('pending_accept','active','blocked','revoked')),
+    permission VARCHAR(16) NOT NULL DEFAULT 'use' CHECK (permission IN ('view','use','manage')),
+    source VARCHAR(32) NOT NULL DEFAULT 'admin_invite',
+    invited_by BIGINT DEFAULT NULL REFERENCES users(id) ON DELETE SET NULL,
+    accepted_at TIMESTAMPTZ DEFAULT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uk_agent_access_user UNIQUE (agent_uid, user_uid)
 );
 `
 
@@ -194,12 +221,35 @@ const migrateBotConfigAddAPIKey = `ALTER TABLE bot_config ADD COLUMN IF NOT EXIS
 const migrateBotConfigAddOwnerID = `ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS owner_id BIGINT DEFAULT NULL;`
 const migrateBotConfigAddVisibility = `ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS visibility VARCHAR(16) NOT NULL DEFAULT 'public';`
 const migrateBotConfigAddTenantName = `ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS tenant_name VARCHAR(128) DEFAULT NULL;`
+const migrateAgentAccessAddStatus = `
+ALTER TABLE agent_access
+  ADD COLUMN IF NOT EXISTS status VARCHAR(24) NOT NULL DEFAULT 'pending_accept',
+  ADD COLUMN IF NOT EXISTS permission VARCHAR(16) NOT NULL DEFAULT 'use',
+  ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'admin_invite',
+  ADD COLUMN IF NOT EXISTS invited_by BIGINT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ DEFAULT NULL;
+`
+const migrateBotConfigAddBodyID = `ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS body_id VARCHAR(128) DEFAULT NULL;`
 const migrateMessagesAddCodeMode = `
 ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS content_blocks JSONB DEFAULT NULL,
   ADD COLUMN IF NOT EXISTS mode VARCHAR(20) DEFAULT 'normal',
   ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT NULL;
 `
+const migrateMessagesAddClientMsgID = `ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(128) DEFAULT NULL;`
+const migrateGroupsAddCreatedAtColumn = `ALTER TABLE "groups" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NULL;`
+const migrateGroupsBackfillCreatedAt = `
+UPDATE "groups" g
+SET created_at = COALESCE(
+  g.created_at,
+  (SELECT t.created_at FROM topics t WHERE t.id = 'grp_' || g.id::text),
+  (SELECT MIN(gm.joined_at) FROM group_members gm WHERE gm.group_id = g.id),
+  CURRENT_TIMESTAMP
+)
+WHERE g.created_at IS NULL;
+`
+const migrateGroupsCreatedAtDefault = `ALTER TABLE "groups" ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP;`
+const migrateGroupsCreatedAtNotNull = `ALTER TABLE "groups" ALTER COLUMN created_at SET NOT NULL;`
 const migrateGroupsAddAnnouncement = `ALTER TABLE "groups" ADD COLUMN IF NOT EXISTS announcement TEXT DEFAULT NULL;`
 const migrateGroupMembersAddMuted = `ALTER TABLE group_members ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE;`
 
@@ -220,10 +270,15 @@ const createMessagesIndexes = `
 CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages (topic_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_topic_id ON messages (topic_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages (reply_to);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_messages_client_msg_id ON messages (topic_id, from_uid, client_msg_id) WHERE client_msg_id IS NOT NULL AND client_msg_id <> '';
 `
 const createBotConfigIndexes = `
 CREATE UNIQUE INDEX IF NOT EXISTS uk_bot_config_api_key ON bot_config (api_key) WHERE api_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_bot_config_owner ON bot_config (owner_id);
+`
+const createAgentAccessIndexes = `
+CREATE INDEX IF NOT EXISTS idx_agent_access_user_status ON agent_access (user_uid, status);
+CREATE INDEX IF NOT EXISTS idx_agent_access_agent_status ON agent_access (agent_uid, status);
 `
 const createGroupMembersIndexes = `
 CREATE INDEX IF NOT EXISTS idx_gm_user ON group_members (user_id);
@@ -245,6 +300,8 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE OR REPLACE TRIGGER trg_friends_updated_at BEFORE UPDATE ON friends
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE OR REPLACE TRIGGER trg_bot_config_updated_at BEFORE UPDATE ON bot_config
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE OR REPLACE TRIGGER trg_agent_access_updated_at BEFORE UPDATE ON agent_access
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE OR REPLACE TRIGGER trg_feedback_reports_updated_at BEFORE UPDATE ON feedback_reports
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
